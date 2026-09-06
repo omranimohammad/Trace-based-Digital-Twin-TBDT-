@@ -1,4 +1,4 @@
-```markdown
+
 # Trace-driven Simulation of Vision-Aided Mobile RAN Control Using ns-3 Digital Twin
 
 This repository contains the simulation framework and source code for the Master's thesis **"Trace-driven Simulation of Vision-Aided Mobile RAN Control Using ns-3 Digital Twin"** by Seyed Mohammad Hossein Omrani, Faculdade de Engenharia da Universidade do Porto (FEUP)[cite: 3]. 
