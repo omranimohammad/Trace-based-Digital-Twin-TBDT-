@@ -1,0 +1,64 @@
+{
+  "Flows": [
+    {
+      "Flow ID": 1,
+      "Protocol": "tcp",
+      "Tx Packets": 45677,
+      "Rx Packets": 45548,
+      "Mean Delay (ms)": 31.6239,
+      "Mean Jitter (ms)": 0.410559,
+      "Throughput (Mbps)": 24.6192,
+      "Packet Loss Ratio (%)": 0.282418
+    },
+    {
+      "Flow ID": 2,
+      "Protocol": "tcp",
+      "Tx Packets": 1,
+      "Rx Packets": 1,
+      "Mean Delay (ms)": 0.000202,
+      "Mean Jitter (ms)": 0,
+      "Throughput (Mbps)": 0,
+      "Packet Loss Ratio (%)": 0
+    },
+    {
+      "Flow ID": 3,
+      "Protocol": "tcp",
+      "Tx Packets": 1,
+      "Rx Packets": 1,
+      "Mean Delay (ms)": 0.000202,
+      "Mean Jitter (ms)": 0,
+      "Throughput (Mbps)": 0,
+      "Packet Loss Ratio (%)": 0
+    },
+    {
+      "Flow ID": 4,
+      "Protocol": "tcp",
+      "Tx Packets": 1,
+      "Rx Packets": 1,
+      "Mean Delay (ms)": 0.000188,
+      "Mean Jitter (ms)": 0,
+      "Throughput (Mbps)": 0,
+      "Packet Loss Ratio (%)": 0
+    },
+    {
+      "Flow ID": 5,
+      "Protocol": "tcp",
+      "Tx Packets": 1,
+      "Rx Packets": 1,
+      "Mean Delay (ms)": 0.000188,
+      "Mean Jitter (ms)": 0,
+      "Throughput (Mbps)": 0,
+      "Packet Loss Ratio (%)": 0
+    },
+    {
+      "Flow ID": 6,
+      "Protocol": "tcp",
+      "Tx Packets": 23823,
+      "Rx Packets": 23697,
+      "Mean Delay (ms)": 0.932105,
+      "Mean Jitter (ms)": 0.507412,
+      "Throughput (Mbps)": 0.62087,
+      "Packet Loss Ratio (%)": 0.528901
+    }
+  ]
+}
