@@ -1,0 +1,499 @@
+#include "ns3/core-module.h"
+#include "ns3/network-module.h"
+#include "ns3/mobility-module.h"
+#include "ns3/antenna-module.h"
+#include "ns3/nr-module.h"
+#include "ns3/applications-module.h"
+#include "ns3/point-to-point-module.h"
+#include "ns3/internet-module.h"
+#include "ns3/flow-monitor-module.h"
+#include "ns3/ipv4-flow-classifier.h"
+#include "ns3/propagation-loss-model.h"
+#include "ns3/spectrum-channel.h" 
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <cmath>
+#include <algorithm>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <string.h>
+
+using namespace ns3;
+
+NS_LOG_COMPONENT_DEFINE("Step3DynamicDigitalTwin");
+
+const double OBSTACLE_RADIUS_METERS = 0.8; 
+double g_current_penalty = 0.0; 
+bool g_isBlockedGlobal = false;
+
+struct TraceRecord {
+    double time;
+    double gnb_x, gnb_y;
+    double ue_x, ue_y;
+    double obs_x, obs_y;
+};
+
+std::vector<TraceRecord> g_traceData;
+uint64_t g_lastTotalRx = 0;
+std::ofstream g_fidelityCsv;
+
+// ==========================================
+// TCP TRACING GLOBALS & CALLBACKS
+// ==========================================
+std::ofstream g_cwndFile;
+std::ofstream g_rttFile;
+
+static void CwndTracer(uint32_t oldCwnd, uint32_t newCwnd) {
+    if (g_cwndFile.is_open()) {
+        g_cwndFile << Simulator::Now().GetSeconds() << "," << newCwnd << "\n";
+    }
+}
+
+static void RttTracer(Time oldRtt, Time newRtt) {
+    if (g_rttFile.is_open()) {
+        g_rttFile << Simulator::Now().GetSeconds() << "," << newRtt.GetSeconds() << "\n";
+    }
+}
+
+static void ConnectTcpTracers() {
+    Config::ConnectWithoutContext(
+        "/NodeList/*/$ns3::TcpL4Protocol/SocketList/*/CongestionWindow",
+        MakeCallback(&CwndTracer)
+    );
+    Config::ConnectWithoutContext(
+        "/NodeList/*/$ns3::TcpL4Protocol/SocketList/*/RTT",
+        MakeCallback(&RttTracer)
+    );
+}
+// ==========================================
+
+
+double GetLatestDataSinr() {
+    std::ifstream file("DlDataSinr.txt");
+    if (!file.is_open()) return 0.0;
+    
+    std::string line, lastLine;
+    while (std::getline(file, line)) {
+        if (!line.empty()) lastLine = line;
+    }
+    if (lastLine.empty()) return 0.0;
+    
+    std::stringstream ss(lastLine);
+    std::string token;
+    int col = 0;
+    double sinr = 0.0;
+    
+    while (std::getline(ss, token, '\t')) {
+        if (col == 4) { 
+            try { sinr = std::stod(token); } catch(...) {}
+            break;
+        }
+        col++;
+    }
+    return sinr;
+}
+
+void MonitorThroughput(Ptr<PacketSink> sink, double interval) {
+    double now = Simulator::Now().GetSeconds();
+    uint64_t totalRx = sink->GetTotalRx();
+    uint64_t bytesReceivedThisInterval = totalRx - g_lastTotalRx;
+    
+    double mbps = (bytesReceivedThisInterval * 8.0) / (interval * 1000 * 1000);
+    double currentSinr = GetLatestDataSinr();
+
+    std::cout << "SIM_THROUGHPUT," << now << "," << mbps << std::endl;
+    std::cout << "SIM_SNR," << now << "," << currentSinr << std::endl;
+    
+    if (g_fidelityCsv.is_open()) {
+        g_fidelityCsv << now << "," << mbps << "," << currentSinr << "," 
+                      << (g_isBlockedGlobal ? 1 : 0) << "\n";
+    }
+
+    g_lastTotalRx = totalRx;
+    Simulator::Schedule(Seconds(interval), &MonitorThroughput, sink, interval);
+}
+
+void VisionAppControlLoop(Ptr<MobilityModel> gnbMob, Ptr<MobilityModel> ueMob, Ptr<MobilityModel> obsMob, bool enableXapp) {
+    Vector gnbPos = gnbMob->GetPosition();
+    Vector uePos = ueMob->GetPosition();
+    Vector obsPos = obsMob->GetPosition();
+
+    std::ostringstream msg;
+    msg << gnbPos.x << "," << gnbPos.y << "," 
+        << uePos.x << "," << uePos.y << "," 
+        << obsPos.x << "," << obsPos.y << ","
+        << (enableXapp ? "1" : "0");
+    std::string message = msg.str();
+
+    int sockfd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sockfd >= 0) {
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof tv);
+
+        struct sockaddr_in servaddr;
+        memset(&servaddr, 0, sizeof(servaddr));
+        
+        servaddr.sin_family = AF_INET;
+        servaddr.sin_port = htons(9999);
+        inet_pton(AF_INET, "127.0.0.1", &servaddr.sin_addr);
+
+        ssize_t sent = sendto(sockfd, message.c_str(), message.length(), 0, (const struct sockaddr *) &servaddr, sizeof(servaddr));
+        if (sent > 0) {
+            char buffer[1024];
+            socklen_t len = sizeof(servaddr);
+            int n = recvfrom(sockfd, (char *)buffer, 1024, MSG_WAITALL, (struct sockaddr *) &servaddr, &len);
+            
+            if (n > 0) {
+                buffer[n] = '\0';
+                std::string recvStr(buffer);
+                size_t commaPos = recvStr.find(',');
+                
+                if (commaPos != std::string::npos) {
+                    double x_target = std::stod(recvStr.substr(0, commaPos));
+                    g_current_penalty = std::stod(recvStr.substr(commaPos + 1));
+                    
+                    // Strictly enforce mobility separation
+                    if (enableXapp) {
+                        gnbMob->SetPosition(Vector(x_target, gnbPos.y, gnbPos.z));
+                    }
+                }
+            }
+        }
+        close(sockfd);
+    }
+    Simulator::Schedule(MilliSeconds(200), &VisionAppControlLoop, gnbMob, ueMob, obsMob, enableXapp);
+}
+
+class MlPropagationLossModel : public PropagationLossModel {
+public:
+    static TypeId GetTypeId(void) {
+        static TypeId tid = TypeId("ns3::MlPropagationLossModel")
+            .SetParent<PropagationLossModel>()
+            .SetGroupName("Propagation")
+            .AddConstructor<MlPropagationLossModel>();
+        return tid;
+    }
+
+    MlPropagationLossModel() {}
+
+    void SetObstacleMobility(Ptr<MobilityModel> obsMobility) {
+        m_obsMobility = obsMobility;
+    }
+
+private:
+    Ptr<MobilityModel> m_obsMobility;
+
+    virtual double DoCalcRxPower(double txPowerDbm, Ptr<MobilityModel> a, Ptr<MobilityModel> b) const override {
+        if (!m_obsMobility) { return txPowerDbm; }
+
+        double now = Simulator::Now().GetSeconds();
+        Vector gnbPos = a->GetPosition();
+        Vector uePos = b->GetPosition();
+        Vector obsPos = m_obsMobility->GetPosition();
+
+        double l2 = std::pow(uePos.x - gnbPos.x, 2) + std::pow(uePos.y - gnbPos.y, 2);
+        double t = 0.0;
+        if (l2 != 0.0) {
+            t = ((obsPos.x - gnbPos.x) * (uePos.x - gnbPos.x) + (obsPos.y - gnbPos.y) * (uePos.y - gnbPos.y)) / l2;
+            t = std::max(0.0, std::min(1.0, t)); 
+        }
+        double projX = gnbPos.x + t * (uePos.x - gnbPos.x);
+        double projY = gnbPos.y + t * (uePos.y - gnbPos.y);
+        double distanceToLoS = std::sqrt(std::pow(obsPos.x - projX, 2) + std::pow(obsPos.y - projY, 2));
+
+        bool isBlocked = (distanceToLoS <= OBSTACLE_RADIUS_METERS);
+        g_isBlockedGlobal = isBlocked;
+
+        double appliedPenalty = isBlocked ? g_current_penalty : 0.0;
+        double finalPower = txPowerDbm - appliedPenalty;
+
+        static int lastPrintedSecond = -1;
+        int currentSecond = static_cast<int>(now);
+        
+        if (currentSecond != lastPrintedSecond) {
+            std::cout << "==================================================" << std::endl;
+            std::cout << "[Time: " << currentSecond << "s] SPATIAL TOPOLOGY:" << std::endl;
+            std::cout << "  -> Tower (gNB) Loc: X=" << gnbPos.x << ", Y=" << gnbPos.y << std::endl;
+            std::cout << "  -> Phone (UE)  Loc: X=" << uePos.x << ", Y=" << uePos.y << std::endl;
+            std::cout << "  -> Obstacle    Loc: X=" << obsPos.x << ", Y=" << obsPos.y << std::endl;
+            std::cout << "[Time: " << currentSecond << "s] RF METRICS:" << std::endl;
+            std::cout << "  -> Line-of-Sight  : " << (isBlocked ? "BLOCKED (NLOS) [X]" : "CLEAR (LoS) [✓]") << std::endl;
+            std::cout << "  -> ML Signal Loss : -" << appliedPenalty << " dB" << std::endl;
+            std::cout << "  -> Channel Power  : " << finalPower << " dBm" << std::endl;
+            lastPrintedSecond = currentSecond;
+        }
+
+        return finalPower;
+    }
+    virtual int64_t DoAssignStreams(int64_t stream) override { return 0; }
+};
+NS_OBJECT_ENSURE_REGISTERED(MlPropagationLossModel);
+
+void LoadTraceData(std::string filename) {
+    std::ifstream file(filename);
+    std::string line;
+    std::getline(file, line); 
+
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        std::stringstream ss(line);
+        std::string token;
+        TraceRecord rec;
+        
+        int col = 0;
+        while (std::getline(ss, token, ',')) {
+            try {
+                if (col == 0) rec.time = std::stod(token);
+                if (col == 1) rec.gnb_x = std::stod(token);
+                if (col == 2) rec.gnb_y = std::stod(token);
+                if (col == 3) rec.ue_x = std::stod(token);
+                if (col == 4) rec.ue_y = std::stod(token);
+                if (col == 5) rec.obs_x = std::stod(token);
+                if (col == 6) rec.obs_y = std::stod(token);
+            } catch (...) {} 
+            col++;
+        }
+        g_traceData.push_back(rec);
+    }
+}
+
+int main(int argc, char *argv[]) {
+    std::string protocol = "tcp";
+    double txPower = 10.0; 
+    bool enableXapp = true; 
+    
+    CommandLine cmd;
+    cmd.AddValue("protocol", "Transport protocol (udp or tcp)", protocol);
+    cmd.AddValue("txPower", "gNB Transmit Power in dBm", txPower);
+    cmd.AddValue("enableXapp", "Enable dynamic xApp robotic evasion policy (true/false)", enableXapp);
+    cmd.Parse(argc, argv);
+
+    LoadTraceData("Cleaned_Trace.csv");
+    if (g_traceData.empty()) {
+        std::cout << "\n[CRITICAL ERROR] Cleaned_Trace.csv is missing!" << std::endl;
+        return 1;
+    }
+
+    double simTime = g_traceData.back().time;
+    std::string expTag = enableXapp ? "expB_counterfactual" : "expA_replication";
+    g_fidelityCsv.open(expTag + "_metrics.csv");
+    g_fidelityCsv << "time,throughput_mbps,sinr_db,is_blocked\n";
+
+    Config::SetDefault("ns3::NrRlcUm::MaxTxBufferSize", UintegerValue(5000000)); 
+    Config::SetDefault("ns3::ArpCache::PendingQueueSize", UintegerValue(100));
+    Config::SetDefault("ns3::ArpCache::AliveTimeout", TimeValue(Hours(10)));
+    Config::SetDefault("ns3::ArpCache::WaitReplyTimeout", TimeValue(Hours(10)));
+    
+    if (protocol == "tcp") {
+        Config::SetDefault("ns3::TcpSocket::SndBufSize", UintegerValue(9999999));
+        Config::SetDefault("ns3::TcpSocket::RcvBufSize", UintegerValue(9999999));
+        Config::SetDefault("ns3::TcpL4Protocol::SocketType", StringValue("ns3::TcpCubic"));
+        Config::SetDefault("ns3::TcpSocket::SegmentSize", UintegerValue(1448));
+        Config::SetDefault("ns3::TcpSocketBase::WindowScaling", BooleanValue(true));
+        Config::SetDefault("ns3::TcpSocket::DataRetries", UintegerValue(100));
+    }
+
+    NodeContainer gnbNode, ueNode, obsNode;
+    gnbNode.Create(1);
+    ueNode.Create(1);
+    obsNode.Create(1);
+
+    MobilityHelper ueMobility, obsMobility;
+    ueMobility.SetMobilityModel("ns3::WaypointMobilityModel");
+    obsMobility.SetMobilityModel("ns3::WaypointMobilityModel");
+    ueMobility.Install(ueNode);
+    obsMobility.Install(obsNode);
+
+    Ptr<WaypointMobilityModel> ueMob = ueNode.Get(0)->GetObject<WaypointMobilityModel>();
+    Ptr<WaypointMobilityModel> obsMob = obsNode.Get(0)->GetObject<WaypointMobilityModel>();
+
+    for (const auto& row : g_traceData) {
+        ueMob->AddWaypoint(Waypoint(Seconds(row.time), Vector(row.ue_x, row.ue_y, 1.5)));
+        obsMob->AddWaypoint(Waypoint(Seconds(row.time), Vector(row.obs_x, row.obs_y, 1.5)));
+    }
+
+    MobilityHelper gnbMobility;
+    Ptr<MobilityModel> gnbMob;
+
+    // Strict separation of Mobility Models
+    if (!enableXapp) {
+        gnbMobility.SetMobilityModel("ns3::WaypointMobilityModel");
+        gnbMobility.Install(gnbNode);
+        Ptr<WaypointMobilityModel> gnbWaypointMob = gnbNode.Get(0)->GetObject<WaypointMobilityModel>();
+        for (const auto& row : g_traceData) {
+            gnbWaypointMob->AddWaypoint(Waypoint(Seconds(row.time), Vector(row.gnb_x, row.gnb_y, 5.0)));
+        }
+        gnbMob = gnbWaypointMob;
+    } else {
+        gnbMobility.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+        gnbMobility.Install(gnbNode);
+        Ptr<ConstantPositionMobilityModel> gnbConstMob = gnbNode.Get(0)->GetObject<ConstantPositionMobilityModel>();
+        gnbConstMob->SetPosition(Vector(g_traceData[0].gnb_x, g_traceData[0].gnb_y, 5.0));
+        gnbMob = gnbConstMob;
+    }
+
+    Ptr<NrPointToPointEpcHelper> epcHelper = CreateObject<NrPointToPointEpcHelper>();
+    Ptr<IdealBeamformingHelper> beamformingHelper = CreateObject<IdealBeamformingHelper>();
+    Ptr<NrHelper> nrHelper = CreateObject<NrHelper>();
+
+    nrHelper->SetGnbBwpManagerAlgorithmAttribute("NGBR_LOW_LAT_EMBB", UintegerValue(0));
+    nrHelper->SetUeBwpManagerAlgorithmAttribute("NGBR_LOW_LAT_EMBB", UintegerValue(0));
+    beamformingHelper->SetAttribute("BeamformingMethod", TypeIdValue(DirectPathBeamforming::GetTypeId()));
+    
+    nrHelper->SetUeAntennaAttribute("NumRows", UintegerValue(1));
+    nrHelper->SetUeAntennaAttribute("NumColumns", UintegerValue(1));
+    nrHelper->SetUeAntennaAttribute("AntennaElement", PointerValue(CreateObject<IsotropicAntennaModel>()));
+    nrHelper->SetGnbAntennaAttribute("NumRows", UintegerValue(1));
+    nrHelper->SetGnbAntennaAttribute("NumColumns", UintegerValue(1));
+    nrHelper->SetGnbAntennaAttribute("AntennaElement", PointerValue(CreateObject<IsotropicAntennaModel>()));
+
+    nrHelper->SetBeamformingHelper(beamformingHelper);
+    nrHelper->SetEpcHelper(epcHelper);
+
+    CcBwpCreator ccBwpCreator;
+    CcBwpCreator::SimpleOperationBandConf bandConf(28e9, 100e6, 1); 
+    OperationBandInfo band = ccBwpCreator.CreateOperationBandContiguousCc(bandConf);
+
+    Ptr<NrChannelHelper> channelHelper = CreateObject<NrChannelHelper>();
+    channelHelper->ConfigureFactories("UMi", "Default", "ThreeGpp"); 
+    channelHelper->SetChannelConditionModelAttribute("UpdatePeriod", TimeValue(MilliSeconds(100)));
+    channelHelper->AssignChannelsToBands({band});
+
+    BandwidthPartInfoPtrVector allBwps = CcBwpCreator::GetAllBwps({band});
+    NetDeviceContainer gnbDevs = nrHelper->InstallGnbDevice(gnbNode, allBwps);
+    NetDeviceContainer ueDevs = nrHelper->InstallUeDevice(ueNode, allBwps);
+
+    Ptr<MlPropagationLossModel> customLoss = CreateObject<MlPropagationLossModel>();
+    customLoss->SetObstacleMobility(obsMob); 
+    
+    Config::MatchContainer matches = Config::LookupMatches("/ChannelList/*");
+    for (uint32_t i = 0; i < matches.GetN(); ++i) {
+        Ptr<SpectrumChannel> chan = DynamicCast<SpectrumChannel>(matches.Get(i));
+        if (chan) {
+            chan->AddPropagationLossModel(customLoss);
+        }
+    }
+
+    nrHelper->GetGnbPhy(gnbDevs.Get(0), 0)->SetAttribute("Numerology", UintegerValue(3)); 
+    nrHelper->GetGnbPhy(gnbDevs.Get(0), 0)->SetAttribute("TxPower", DoubleValue(txPower)); 
+    nrHelper->GetGnbPhy(gnbDevs.Get(0), 0)->SetAttribute("NoiseFigure", DoubleValue(9.0));
+    nrHelper->GetUePhy(ueDevs.Get(0), 0)->SetAttribute("NoiseFigure", DoubleValue(7.0));
+
+    InternetStackHelper internet;
+    internet.SetIpv6StackInstall(false); 
+    internet.Install(ueNode);
+
+    auto [remoteHost, remoteHostIpv4Address] = epcHelper->SetupRemoteHost("42Mb/s", 2500, Seconds(0)); 
+    Ipv4InterfaceContainer ueIpIface = epcHelper->AssignUeIpv4Address(ueDevs);
+
+    nrHelper->AttachToClosestGnb(ueDevs, gnbDevs);
+
+    uint16_t dlPort = 1234;
+    std::string socketFactory = (protocol == "udp") ? "ns3::UdpSocketFactory" : "ns3::TcpSocketFactory";
+    
+    PacketSinkHelper dlPacketSink(socketFactory, InetSocketAddress(Ipv4Address::GetAny(), dlPort));
+    ApplicationContainer serverApp = dlPacketSink.Install(ueNode.Get(0));
+
+    ApplicationContainer clientApp;
+    if (protocol == "tcp") {
+        BulkSendHelper dlClient(socketFactory, InetSocketAddress(ueIpIface.GetAddress(0), dlPort));
+        dlClient.SetAttribute("MaxBytes", UintegerValue(0)); 
+        clientApp = dlClient.Install(remoteHost);
+    } else {
+        UdpClientHelper dlClient(ueIpIface.GetAddress(0), dlPort);
+        dlClient.SetAttribute("MaxPackets", UintegerValue(10000000));
+        dlClient.SetAttribute("PacketSize", UintegerValue(1252));
+        dlClient.SetAttribute("Interval", TimeValue(MicroSeconds(238))); 
+        clientApp = dlClient.Install(remoteHost);
+    }
+
+    NrEpsBearer bearer(NrEpsBearer::NGBR_LOW_LAT_EMBB);
+    Ptr<NrEpcTft> tft = Create<NrEpcTft>();
+    NrEpcTft::PacketFilter pf;
+    pf.localPortStart = dlPort;
+    pf.localPortEnd = dlPort;
+    tft->Add(pf);
+    nrHelper->ActivateDedicatedEpsBearer(ueDevs.Get(0), bearer, tft);
+
+    serverApp.Start(Seconds(0.0)); 
+    clientApp.Start(Seconds(0.0));
+    serverApp.Stop(Seconds(simTime + 0.1));
+    clientApp.Stop(Seconds(simTime));
+
+    FlowMonitorHelper flowmonHelper;
+    Ptr<FlowMonitor> monitor = flowmonHelper.InstallAll();
+
+    std::cout << "\n--- RUNNING SCENARIO: " << expTag << " ---\n" << std::endl;
+
+    // =======================================================
+    // SCHEDULE TCP TRACING (Names align with python scripts)
+    // =======================================================
+    if (protocol == "tcp") {
+        std::string cwndName = enableXapp ? "tcp_cwnd.csv" : "baseline_tcp_cwnd.csv";
+        std::string rttName = enableXapp ? "tcp_rtt.csv" : "baseline_tcp_rtt.csv";
+        
+        g_cwndFile.open(cwndName, std::ios::out);
+        g_rttFile.open(rttName, std::ios::out);
+        
+        if (g_cwndFile.is_open()) g_cwndFile << "Time,Cwnd\n";
+        if (g_rttFile.is_open()) g_rttFile << "Time,RTT\n";
+        
+        // Schedule just after sockets are created internally
+        Simulator::Schedule(Seconds(0.0001), &ConnectTcpTracers);
+    }
+    // =======================================================
+
+    Ptr<PacketSink> sink = DynamicCast<PacketSink>(serverApp.Get(0));
+    Simulator::Schedule(Seconds(0.1), &MonitorThroughput, sink, 0.1);
+    Simulator::Schedule(Seconds(0.0), &VisionAppControlLoop, gnbMob, ueMob, obsMob, enableXapp);
+
+    nrHelper->EnableTraces();
+    Simulator::Stop(Seconds(simTime + 0.2));
+    Simulator::Run();
+
+    monitor->CheckForLostPackets(Seconds(1.0));
+    Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowmonHelper.GetClassifier());
+    
+    std::string jsonFilename = expTag + "_flowmon_" + protocol + ".json";
+    std::ofstream flowmonOutputFile(jsonFilename);
+    flowmonOutputFile << "{\n  \"Flows\": [\n";
+    
+    bool firstFlow = true;
+    FlowMonitor::FlowStatsContainer stats = monitor->GetFlowStats();
+
+    for (auto i = stats.begin(); i != stats.end(); ++i) {
+        Time rxDuration = i->second.timeLastRxPacket - i->second.timeFirstRxPacket;
+        double finalThroughput = (rxDuration.GetSeconds() > 0) ? (i->second.rxBytes * 8.0 / rxDuration.GetSeconds() / 1e6) : 0.0;
+        double meanDelay = (i->second.rxPackets > 0) ? (1000 * i->second.delaySum.GetSeconds() / i->second.rxPackets) : 0.0;
+        double meanJitter = (i->second.rxPackets > 0) ? (1000 * i->second.jitterSum.GetSeconds() / i->second.rxPackets) : 0.0;
+        double packetLossRatio = (i->second.txPackets > 0) ? ((i->second.txPackets - i->second.rxPackets) / (double)i->second.txPackets * 100) : 0.0;
+
+        if (!firstFlow) { flowmonOutputFile << ",\n"; }
+        firstFlow = false;
+
+        flowmonOutputFile << "    {\n"
+                          << "      \"Flow ID\": " << i->first << ",\n"
+                          << "      \"Protocol\": \"" << protocol << "\",\n"
+                          << "      \"Tx Packets\": " << i->second.txPackets << ",\n"
+                          << "      \"Rx Packets\": " << i->second.rxPackets << ",\n"
+                          << "      \"Mean Delay (ms)\": " << meanDelay << ",\n"
+                          << "      \"Mean Jitter (ms)\": " << meanJitter << ",\n"
+                          << "      \"Throughput (Mbps)\": " << finalThroughput << ",\n"
+                          << "      \"Packet Loss Ratio (%)\": " << packetLossRatio << "\n"
+                          << "    }";
+    }
+    flowmonOutputFile << "\n  ]\n}\n";
+    flowmonOutputFile.close();
+
+    // Close open file streams gracefully
+    if (g_fidelityCsv.is_open()) g_fidelityCsv.close();
+    if (g_cwndFile.is_open()) g_cwndFile.close();
+    if (g_rttFile.is_open()) g_rttFile.close();
+
+    Simulator::Destroy();
+    return 0;
+}

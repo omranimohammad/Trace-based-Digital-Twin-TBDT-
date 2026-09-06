@@ -1,0 +1,236 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import re
+import numpy as np
+
+def parse_sim_data(filepath):
+    """Parses both the Spatial Topology and Throughput from the Digital Twin text file."""
+    sim_nodes = {}
+    sim_throughput = []
+    
+    with open(filepath, 'r') as f:
+        lines = f.readlines()
+        
+    current_time = None
+    
+    for line in lines:
+        # 1. Extract Spatial Topology Time
+        time_match = re.search(r'\[Time:\s*(\d+)s\] SPATIAL TOPOLOGY:', line)
+        if time_match:
+            current_time = int(time_match.group(1))
+            if current_time not in sim_nodes:
+                sim_nodes[current_time] = {}
+                
+        # 2. Extract Coordinates (gNB, UE, Obstacle)
+        gnb_match = re.search(r'Tower \(gNB\).*?Loc: X=([\d\.]+), Y=([\d\.]+)', line)
+        if gnb_match and current_time is not None:
+            sim_nodes[current_time]['gNB_x'] = float(gnb_match.group(1))
+            sim_nodes[current_time]['gNB_y'] = float(gnb_match.group(2))
+            
+        ue_match = re.search(r'Phone \(UE\).*?Loc: X=([\d\.]+), Y=([\d\.]+)', line)
+        if ue_match and current_time is not None:
+            sim_nodes[current_time]['UE_x'] = float(ue_match.group(1))
+            sim_nodes[current_time]['UE_y'] = float(ue_match.group(2))
+            
+        obs_match = re.search(r'Obstacle.*?Loc: X=([\d\.]+), Y=([\d\.]+)', line)
+        if obs_match and current_time is not None:
+            sim_nodes[current_time]['Obstacle_x'] = float(obs_match.group(1))
+            sim_nodes[current_time]['Obstacle_y'] = float(obs_match.group(2))
+            
+        # 3. Extract Throughput
+        thr_match = re.search(r'SIM_THROUGHPUT,([\d\.]+),([\d\.]+)', line)
+        if thr_match:
+            sim_throughput.append({'time': float(thr_match.group(1)), 'throughput': float(thr_match.group(2))})
+            
+    # Convert node topology to dataframe
+    sim_df = pd.DataFrame.from_dict(sim_nodes, orient='index').sort_index()
+    sim_df.index.name = 'time'
+    
+    # Convert throughput to dataframe
+    sim_thr_df = pd.DataFrame(sim_throughput)
+    if not sim_thr_df.empty:
+        sim_thr_df = sim_thr_df.sort_values('time').set_index('time')
+        
+    return sim_df, sim_thr_df
+
+def main():
+    # 1. Load Data
+    real_df = pd.read_csv('Real_Trace.csv')
+    sim_df, sim_thr_df = parse_sim_data('final_validation_output.txt')
+    
+    # --- FIX 1: Force Sim Throughput to stay at 0 until exactly Time=3.0s ---
+    if 0.0 not in sim_thr_df.index:
+        sim_thr_df.loc[0.0] = 0.0
+    if 3.0 not in sim_thr_df.index:
+        sim_thr_df.loc[3.0] = 0.0
+    sim_thr_df = sim_thr_df.sort_index()
+
+    # --- FIX 2: Create a High-Resolution Time Array (Every 10 Milliseconds) ---
+    max_time = max(real_df['tstamp'].max(), sim_thr_df.index.max())
+    # np.arange(start, stop, step) -> 0.01 means 10ms resolution
+    tstamps_hr = np.arange(0.0, max_time + 0.01, 0.01)
+    
+    # --- Align and Interpolate REAL Spatial Data to 10ms ---
+    real_spat_df = real_df.set_index('tstamp')
+    real_spat_df = real_spat_df.reindex(real_spat_df.index.union(tstamps_hr))
+    real_spat_df = real_spat_df.interpolate(method='index').loc[tstamps_hr].bfill().ffill()
+    
+    # --- Align and Interpolate SIM Spatial Data to 10ms ---
+    sim_spat_df = sim_df.reindex(sim_df.index.union(tstamps_hr))
+    sim_spat_df = sim_spat_df.interpolate(method='index').loc[tstamps_hr].bfill().ffill()
+
+    # --- Align and Interpolate REAL Throughput to 10ms ---
+    real_thr_df = real_df[['tstamp', 'Throughput (Mbit/s)']].set_index('tstamp')
+    real_thr_df = real_thr_df.reindex(real_thr_df.index.union(tstamps_hr))
+    real_thr_df = real_thr_df.interpolate(method='index').loc[tstamps_hr].fillna(0.0)
+
+    # --- Align and Interpolate SIM Throughput to 10ms ---
+    sim_thr_df_hr = sim_thr_df.reindex(sim_thr_df.index.union(tstamps_hr))
+    sim_thr_df_hr = sim_thr_df_hr.interpolate(method='index').loc[tstamps_hr].fillna(0.0)
+
+    # Convert to fast numpy arrays for smooth animation
+    real_thr_v = real_thr_df['Throughput (Mbit/s)'].to_numpy()
+    sim_thr_v = sim_thr_df_hr['throughput'].to_numpy()
+    
+    # ---------------------------------------------------------
+    # NEW: QUANTITATIVE METRICS (SPATIAL EVASION & THROUGHPUT)
+    # ---------------------------------------------------------
+    # 1. Spatial Evasion Offset
+    error_x = real_spat_df['gnb_x'].to_numpy() - sim_spat_df['gNB_x'].to_numpy()
+    error_y = real_spat_df['gnb_y'].to_numpy() - sim_spat_df['gNB_y'].to_numpy()
+    position_error = np.sqrt(error_x**2 + error_y**2)
+    rmse = np.sqrt(np.mean(position_error**2))
+    max_dev = np.max(position_error)
+    
+    # 2. Throughput Fidelity (Comparing only when both have CLEAR LoS)
+    # We find indices where the real network was actually working (>35 Mbps)
+    clear_los_indices = np.where(real_thr_v > 35.0)[0]
+    if len(clear_los_indices) > 0:
+        real_clear = real_thr_v[clear_los_indices]
+        sim_clear = sim_thr_v[clear_los_indices]
+        mae_throughput = np.mean(np.abs(real_clear - sim_clear))
+        # Percentage = 100 - (Error / Max_Capacity * 100)
+        fidelity_pct = max(0, 100 * (1 - (mae_throughput / 42.0)))
+    else:
+        fidelity_pct = 0.0
+
+    # 3. Overall Network Improvement (Because of AI Evasion)
+    real_mean_thr = np.mean(real_thr_v)
+    sim_mean_thr = np.mean(sim_thr_v)
+    improvement_pct = ((sim_mean_thr - real_mean_thr) / real_mean_thr) * 100 if real_mean_thr > 0 else 0
+
+    print("\n" + "="*45)
+    print("      QUANTITATIVE DIGITAL TWIN METRICS")
+    print("="*45)
+    print(f"RMS Evasion Distance:      {rmse:.4f} meters")
+    print(f"Max Evasion Deviation:     {max_dev:.4f} meters")
+    print("-" * 45)
+    print(f"LoS Throughput Fidelity:   {fidelity_pct:.2f}% Match")
+    print(f"AI Throughput Improvement: +{improvement_pct:.2f}% Gain")
+    print("="*45 + "\n")
+    # ---------------------------------------------------------
+    
+    # 3. Setup the Subplots
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    fig.suptitle("Live Digital Twin Validation (10ms High-Resolution)", fontsize=16, y=0.98)
+    
+    # ==========================
+    # Panel 1: Map Layout
+    # ==========================
+    ax1.set_title("Mobility & LOS Analysis")
+    ax1.set_xlim(0, 10)
+    ax1.set_ylim(0, 12)
+    ax1.grid(True, linestyle=':', alpha=0.6)
+    ax1.set_xlabel('X Coordinate (m)')
+    ax1.set_ylabel('Y Coordinate (m)')
+    
+    # Markers scaled down to size 10 to reduce clutter
+    real_gnb, = ax1.plot([], [], 'bs', markersize=10, label='Real gNB')
+    real_ue,  = ax1.plot([], [], 'g^', markersize=10, label='Real UE')
+    real_obs, = ax1.plot([], [], 'ro', markersize=10, label='Real Obstacle')
+    real_los, = ax1.plot([], [], 'k--', linewidth=2, alpha=0.7, label='Real LOS Beam')
+    
+    sim_gnb, = ax1.plot([], [], 'bs', markersize=10, markerfacecolor='none', markeredgewidth=2, label='Sim gNB')
+    sim_ue,  = ax1.plot([], [], 'g^', markersize=10, markerfacecolor='none', markeredgewidth=2, label='Sim UE')
+    sim_obs, = ax1.plot([], [], 'ro', markersize=10, markerfacecolor='none', markeredgewidth=2, label='Sim Obstacle')
+    sim_los, = ax1.plot([], [], 'm:', linewidth=2, alpha=0.7, label='Sim LOS Beam')
+    
+    # Text box shrunk and pushed to very top edge (0.98) to avoid overlap
+    time_text = ax1.text(0.02, 0.98, '', transform=ax1.transAxes, fontsize=9, verticalalignment='top', bbox=dict(facecolor='white', alpha=0.9))
+    
+    # Legend shrunk and line spacing tightened
+    ax1.legend(loc='upper right', fontsize=8, labelspacing=0.3)
+    
+    # ==========================
+    # Panel 2: Throughput Layout
+    # ==========================
+    ax2.set_title("Throughput Over Time")
+    ax2.set_xlim(0, max_time + 1)
+    
+    # Dynamically scale Y-axis to capture the 125+ Mbps spikes perfectly
+    max_y = max(np.max(real_thr_v), np.max(sim_thr_v))
+    ax2.set_ylim(0, max_y + 10) 
+    
+    ax2.grid(True, linestyle=':', alpha=0.6)
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Throughput (Mbit/s)')
+    
+    # Draw faint full lines in background
+    ax2.plot(tstamps_hr, real_thr_v, color='purple', alpha=0.15, linestyle='-')
+    ax2.plot(tstamps_hr, sim_thr_v, color='orange', alpha=0.15, linestyle='--')
+    
+    real_thr_line, = ax2.plot([], [], color='purple', linewidth=2.5, label='Real Throughput')
+    sim_thr_line, = ax2.plot([], [], color='orange', linewidth=2.5, linestyle='--', label='Sim Throughput')
+    
+    time_marker = ax2.axvline(x=0, color='red', alpha=0.6, linestyle=':')
+    ax2.legend(loc='upper right')
+
+    # 4. Animation Update Function
+    def update(frame_idx):
+        t = tstamps_hr[frame_idx]
+        
+        row_real = real_spat_df.iloc[frame_idx]
+        row_sim = sim_spat_df.iloc[frame_idx]
+        
+        # --- Update Map ---
+        real_gnb.set_data([row_real['gnb_x']], [row_real['gnb_y']])
+        real_ue.set_data([row_real['ue_x']], [row_real['ue_y']])
+        real_obs.set_data([row_real['obs_x']], [row_real['obs_y']])
+        real_los.set_data([row_real['gnb_x'], row_real['ue_x']], [row_real['gnb_y'], row_real['ue_y']])
+        
+        # Check blockage status from the real dataframe
+        if str(row_real['Blockage']).upper() == 'TRUE':
+            real_los.set_color('red')       # Blocked
+        else:
+            real_los.set_color('green')     # Clear LoS
+            
+        sim_gnb.set_data([row_sim['gNB_x']], [row_sim['gNB_y']])
+        sim_ue.set_data([row_sim['UE_x']], [row_sim['UE_y']])
+        sim_obs.set_data([row_sim['Obstacle_x']], [row_sim['Obstacle_y']])
+        sim_los.set_data([row_sim['gNB_x'], row_sim['UE_x']], [row_sim['gNB_y'], row_sim['UE_y']])
+        
+        # --- Update Texts ---
+        status = "Blocked" if str(row_real['Blockage']).upper() == 'TRUE' else "Clear"
+        r_thr = real_thr_v[frame_idx]
+        s_thr = sim_thr_v[frame_idx]
+        
+        time_text.set_text(f'Time: {t:.2f}s\nReal LOS: {status}\nReal Throughput: {r_thr:.1f} Mbps\nSim Throughput:  {s_thr:.1f} Mbps')
+        
+        # --- Update Throughput Lines ---
+        real_thr_line.set_data(tstamps_hr[:frame_idx+1], real_thr_v[:frame_idx+1])
+        sim_thr_line.set_data(tstamps_hr[:frame_idx+1], sim_thr_v[:frame_idx+1])
+        time_marker.set_xdata([t])
+        
+        return real_gnb, real_ue, real_obs, real_los, sim_gnb, sim_ue, sim_obs, sim_los, time_text, real_thr_line, sim_thr_line, time_marker
+
+    # 5. Run Animation
+    # Interval = 10ms (matches our 10ms data resolution perfectly for Real-Time playback)
+    ani = animation.FuncAnimation(fig, update, frames=len(tstamps_hr), interval=10, blit=True)
+    
+    # Adjust layout to prevent title overlap and clipping
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    plt.show()
+
+if __name__ == "__main__":
+    main()
